@@ -166,27 +166,47 @@ int main(int argc, char* argv[]) {
         {
             std::lock_guard<std::mutex> lock(g_dbMutex);
 
+    #ifdef _WIN32
+            system("cls");
+    #else
+            system("clear");
+    #endif
             std::cout << "\n===== AP List =====\n";
-            std::cout << "BSSID              PWR   Beacons  #Data  ENC   ESSID\n";
+            std::cout 
+                << std::left << std::setw(20) << "BSSID"
+                << std::setw(6) << "PWR"
+                << std::setw(9) << "Beacons"
+                << std::setw(7) << "#Data"
+                << std::setw(6) << "ENC"
+                << std::setw(15) << "ESSID"
+                << "\n";
             std::cout << "------------------------------------------------------\n";
             for (auto& kv : g_apDatabase) {
                 const AirodumpApInfo& ap = kv.second;
-                std::cout << ap.bssid << "  "
-                          << ap.pwr << "dBm  "
-                          << ap.beaconCount << "       "
-                          << ap.dataCount << "      "
-                          << ap.encryption << "   "
-                          << ap.essid << "\n";
+                std::cout 
+                    << std::left << std::setw(20) << (std::string)ap.bssid
+                    << std::setw(6) << ap.pwr
+                    << std::setw(9) << ap.beaconCount
+                    << std::setw(7) << ap.dataCount
+                    << std::setw(6) << ap.encryption
+                    << std::setw(15) << ap.essid
+                    << "\n";
             }
 
             std::cout << "\n===== Station List =====\n";
-            std::cout << "Station            BSSID             #Data\n";
+            std::cout 
+                << std::left << std::setw(20) << "Station"
+                << std::left << std::setw(20) << "BSSID"
+                << std::left << "#Data"
+                << "\n";
             std::cout << "------------------------------------------------------\n";
             for (auto& kv : g_stationDatabase) {
                 const AirodumpStationInfo& st = kv.second;
-                std::cout << st.stationMac << "  "
-                          << st.connectedBssid << "  "
-                          << st.dataCount << "\n";
+                std::cout 
+                    << std::left << std::setw(20) << (std::string)st.stationMac
+                    << std::left << std::setw(20) << (std::string)st.connectedBssid
+                    << std::left <<st.dataCount
+                    << "\n";
             }
             std::cout << "------------------------------------------------------\n";
         }
