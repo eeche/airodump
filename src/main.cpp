@@ -8,6 +8,7 @@
 #include <pcap.h>
 #include <cstring>
 #include <vector>
+#include <iomanip>
 
 #include "MacAddr.h"
 #include "AirodumpApInfo.h"
@@ -34,6 +35,7 @@ void signalHandler(int signo) {
     g_terminate = true;
 }
 
+// 채널 리스트
 struct ChannelInfo {
     int channelNumber;
     int frequency;
@@ -45,25 +47,97 @@ static std::vector<ChannelInfo> g_channels = {
     {11, 2462},
 };
 
+// ----------------------------------------------------------------------------
+// 채널 호핑 함수
+// ----------------------------------------------------------------------------
 void channelHopper(const std::string& interface) {
     size_t idx = 0;
     while (g_running) {
         std::string cmd = "iwconfig " + interface + " channel " + std::to_string(g_channels[idx].channelNumber);
         system(cmd.c_str());
 
-        // 1초 정도 대기 후 다음 채널
         std::this_thread::sleep_for(std::chrono::seconds(1));
         idx = (idx + 1) % g_channels.size();
     }
 }
 
+// ----------------------------------------------------------------------------
+// 실제 Beacon 프레임의 Tagged Parameter에서 ESSID/Encryption 추출
+// ----------------------------------------------------------------------------
+static void parseBeacon(const uint8_t* dot11Ptr, int dot11Len, int powerDbm) {
+    // 1) Dot11 MAC 헤더
+    const Dot11Hdr* dot11 = reinterpret_cast<const Dot11Hdr*>(dot11Ptr);
+    size_t dot11HdrLen = sizeof(Dot11Hdr);
+    if (dot11Len < (int)dot11HdrLen) return;
+
+    // 2) 고정 파라미터(12바이트: Timestamp(8)+BeaconInterval(2)+Capability(2))
+    const size_t fixedLen = 12;
+    if (dot11Len < (int)(dot11HdrLen + fixedLen)) return;
+
+    // BSSID
+    MacAddr bssid(dot11->addr3);
+
+    // 3) Tagged Parameter 시작 지점
+    const uint8_t* tagPtr = dot11Ptr + dot11HdrLen + fixedLen;
+    size_t remain = dot11Len - (dot11HdrLen + fixedLen);
+
+    std::string essidStr = "(hidden)";
+    std::string encStr = "OPEN";
+
+    // 4) 태그 순회
+    while (remain >= 2) {
+        uint8_t tagNumber = tagPtr[0];
+        uint8_t tagLength = tagPtr[1];
+        if (remain < (size_t)(2 + tagLength)) {
+            break; // 잘못된 태그 or 끝
+        }
+
+        const uint8_t* tagData = tagPtr + 2;
+
+        if (tagNumber == 0) { 
+            // SSID 태그
+            if (tagLength > 0) {
+                essidStr.assign(reinterpret_cast<const char*>(tagData), tagLength);
+            } else {
+                essidStr = "(hidden)";
+            }
+        } 
+        else if (tagNumber == 0x30) {
+            // RSN => WPA2
+            encStr = "WPA2";
+        }
+        else if (tagNumber == 0xdd) {
+            // Vendor Specific => WPA(가능성)
+            // 실제로는 태그 내부 OUI(0x00 0x50 0xf2) 등을 검사
+            encStr = "WPA";
+        }
+
+        tagPtr += (2 + tagLength);
+        remain -= (2 + tagLength);
+    }
+
+    // 5) DB 업데이트
+    {
+        std::lock_guard<std::mutex> lock(g_dbMutex);
+
+        AirodumpApInfo& ap = g_apDatabase[bssid];
+        ap.bssid = bssid;
+        ap.pwr = powerDbm;
+        ap.beaconCount++;
+        ap.essid = essidStr;       // 파싱한 ESSID
+        ap.encryption = encStr;    // OPEN / WPA / WPA2
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 패킷 핸들러
+// ----------------------------------------------------------------------------
 void packetHandler(u_char* userData, const struct pcap_pkthdr* header, const u_char* packet) {
     int radiotapLen = 0;
     int powerDbm = 0;
 
     if (!parseRadiotap(packet, header->len, radiotapLen, powerDbm)) {
-        // Radiotap 파싱 실패
-        return;
+        return; // Radiotap 파싱 실패
     }
 
     // 802.11 헤더 시작점
@@ -75,53 +149,59 @@ void packetHandler(u_char* userData, const struct pcap_pkthdr* header, const u_c
 
     const Dot11Hdr* dot11 = reinterpret_cast<const Dot11Hdr*>(dot11Ptr);
     uint16_t fc = dot11->frameControl;
-
-    // 엔디안 이슈 있으므로 호스트 바이트 오더로 변환
-    uint16_t fc_le = fc;
+    uint16_t fc_le = fc; // 엔디안 고려(간단히 fc 그대로 씀)
 
     if (isBeaconFrame(fc_le)) {
-        // Beacon -> BSSID = addr3
-        MacAddr bssid(dot11->addr3);
+        // Beacon 프레임 파싱
+        parseBeacon(dot11Ptr, dot11Len, powerDbm);
+    } 
+    else if (isDataFrame(fc_le)) {
+        // Data 프레임: To DS / From DS 비트 확인
+        uint8_t toDs   = (fc_le & 0x0100) >> 8;
+        uint8_t fromDs = (fc_le & 0x0200) >> 9;
 
-        // Beacon count 증가 등
-        std::lock_guard<std::mutex> lock(g_dbMutex);
-        AirodumpApInfo& ap = g_apDatabase[bssid];
-        ap.bssid = bssid;
-        ap.pwr = powerDbm;
-        ap.beaconCount++;
-
-        // ESSID, Encryption 추출 -> Tagged Parameter 파싱 필요
-        // 여기서는 간단히 "UnknownESSID", "WPA2" 가정
-        ap.essid = "UnknownESSID";
-        ap.encryption = "WPA2";
-
-    } else if (isDataFrame(fc_le)) {
-        // 데이터 프레임: addr2 = Station, addr1 = AP(BSSID) or vice versa
-        // QoS, from/to DS 플래그 등 구분 필요
-        // 여기서는 간단히 addr2를 Station으로, addr1를 BSSID로 가정
-
-        MacAddr stationMac(dot11->addr2);
-        MacAddr maybeBssid(dot11->addr1);
-
-        std::lock_guard<std::mutex> lock(g_dbMutex);
-
-        // AP DB에 존재한다면 dataCount++
-        auto it = g_apDatabase.find(maybeBssid);
-        if (it != g_apDatabase.end()) {
-            it->second.dataCount++;
+        MacAddr stationMac, bssidMac;
+        // Infrastructure 모드: 
+        //  - station -> AP => Addr1 = BSSID, Addr2 = Station
+        //  - AP -> station => Addr1 = Station, Addr2 = BSSID
+        if (!fromDs && toDs) {
+            // station -> AP
+            bssidMac   = MacAddr(dot11->addr1);
+            stationMac = MacAddr(dot11->addr2);
+        } else if (fromDs && !toDs) {
+            // AP -> station
+            stationMac = MacAddr(dot11->addr1);
+            bssidMac   = MacAddr(dot11->addr2);
+        } else {
+            // ad-hoc, WDS 등은 간단 예시에선 스킵
+            return;
         }
 
-        // Station DB 관리
-        AirodumpStationInfo& stn = g_stationDatabase[stationMac];
-        stn.stationMac = stationMac;
-        stn.connectedBssid = maybeBssid;
-        stn.dataCount++;
-    } else {
+        {
+            std::lock_guard<std::mutex> lock(g_dbMutex);
+
+            // AP DB에 존재한다면 dataCount++
+            auto it = g_apDatabase.find(bssidMac);
+            if (it != g_apDatabase.end()) {
+                it->second.dataCount++;
+            }
+
+            // Station DB 관리
+            AirodumpStationInfo& stn = g_stationDatabase[stationMac];
+            stn.stationMac = stationMac;
+            stn.connectedBssid = bssidMac;
+            stn.dataCount++;
+        }
+    }
+    else {
         // Probe, RTS/CTS, 관리 프레임 등등...
         // 필요시 추가 파싱
     }
 }
 
+// ----------------------------------------------------------------------------
+// main()
+// ----------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         std::cerr << "syntax : airodump <interface>\n"
@@ -131,7 +211,7 @@ int main(int argc, char* argv[]) {
 
     std::string interface = argv[1];
 
-    // 시그널 핸들러 등록
+    // 시그널 핸들러
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
@@ -145,14 +225,14 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Radiotap(802.11 모니터링)을 위해 링크 타입 확인
+    // Radiotap(802.11) 모니터링 체크
     if (pcap_datalink(g_handle) != DLT_IEEE802_11_RADIO) {
         std::cerr << "[-] Not a radiotap header capture. Try setting monitor mode on interface.\n";
         pcap_close(g_handle);
         return -1;
     }
 
-    // 채널 호핑 시작
+    // 채널 호핑
     g_running = true;
     g_hopperThread = std::thread(channelHopper, interface);
 
@@ -161,38 +241,41 @@ int main(int argc, char* argv[]) {
         pcap_loop(g_handle, 0, packetHandler, nullptr);
     });
 
-    // 메인 스레드는 주기적으로 AP/Station 정보를 출력
+    // 메인 스레드: 주기적으로 AP/Station 정보 출력
     while (!g_terminate) {
         {
             std::lock_guard<std::mutex> lock(g_dbMutex);
 
-    #ifdef _WIN32
+#ifdef _WIN32
             system("cls");
-    #else
+#else
             system("clear");
-    #endif
+#endif
+            // ----------------- AP List -----------------
             std::cout << "\n===== AP List =====\n";
-            std::cout 
-                << std::left << std::setw(20) << "BSSID"
-                << std::setw(6) << "PWR"
-                << std::setw(9) << "Beacons"
-                << std::setw(7) << "#Data"
-                << std::setw(6) << "ENC"
-                << std::setw(15) << "ESSID"
+            std::cout
+                << std::left  << std::setw(20) << "BSSID"
+                << std::left  << std::setw(6)  << "PWR"
+                << std::left  << std::setw(9)  << "Beacons"
+                << std::left  << std::setw(7)  << "#Data"
+                << std::left  << std::setw(6)  << "ENC"
+                << std::left  << std::setw(15) << "ESSID"
                 << "\n";
             std::cout << "------------------------------------------------------\n";
+
             for (auto& kv : g_apDatabase) {
                 const AirodumpApInfo& ap = kv.second;
                 std::cout 
                     << std::left << std::setw(20) << (std::string)ap.bssid
-                    << std::setw(6) << ap.pwr
-                    << std::setw(9) << ap.beaconCount
-                    << std::setw(7) << ap.dataCount
-                    << std::setw(6) << ap.encryption
-                    << std::setw(15) << ap.essid
+                    << std::left << std::setw(6)  << (std::to_string(ap.pwr) + "dBm")
+                    << std::left << std::setw(9)  << ap.beaconCount
+                    << std::left << std::setw(7)  << ap.dataCount
+                    << std::left << std::setw(6)  << ap.encryption
+                    << std::left << std::setw(15) << ap.essid
                     << "\n";
             }
 
+            // ----------------- Station List -----------------
             std::cout << "\n===== Station List =====\n";
             std::cout 
                 << std::left << std::setw(20) << "Station"
@@ -200,12 +283,13 @@ int main(int argc, char* argv[]) {
                 << std::left << "#Data"
                 << "\n";
             std::cout << "------------------------------------------------------\n";
+
             for (auto& kv : g_stationDatabase) {
                 const AirodumpStationInfo& st = kv.second;
-                std::cout 
+                std::cout
                     << std::left << std::setw(20) << (std::string)st.stationMac
                     << std::left << std::setw(20) << (std::string)st.connectedBssid
-                    << std::left <<st.dataCount
+                    << st.dataCount
                     << "\n";
             }
             std::cout << "------------------------------------------------------\n";
