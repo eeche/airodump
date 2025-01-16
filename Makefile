@@ -2,21 +2,28 @@ CXX = g++
 CXXFLAGS = -Wall -std=c++17 -I. -I./src
 
 SRCDIR = src
-OBJS = $(SRCDIR)/AirodumpApInfo.o \
-       $(SRCDIR)/AirodumpStationInfo.o \
-       $(SRCDIR)/MacAddr.o \
-       $(SRCDIR)/my_radiotap.o \
-       $(SRCDIR)/main.o
-
+BUILDDIR = build
+BINDIR = bin
 TARGET = airodump
 
-all: $(TARGET)
+# src/*.cpp 전체 탐색
+SOURCES = $(wildcard $(SRCDIR)/*.cpp)
+# 소스 -> 오브젝트로 변경
+OBJECTS = $(patsubst $(SRCDIR)/%.cpp, $(BUILDDIR)/%.o, $(SOURCES))
 
-$(TARGET): $(OBJS)
+all: directories $(BINDIR)/$(TARGET)
+
+# 빌드 디렉토리, 바이너리 디렉토리 생성
+directories:
+	mkdir -p $(BUILDDIR) $(BINDIR)
+
+# 최종 실행 파일을 bin/ 폴더 안에 생성
+$(BINDIR)/$(TARGET): $(OBJECTS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lpcap -lpthread
 
-%.o: %.cpp
+# 각 .cpp를 build/ 폴더 안의 .o로 빌드
+$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -rf $(BUILDDIR) $(BINDIR)
