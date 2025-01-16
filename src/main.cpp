@@ -267,7 +267,7 @@ int main(int argc, char* argv[]) {
                 const AirodumpApInfo& ap = kv.second;
                 std::cout 
                     << std::left << std::setw(20) << (std::string)ap.bssid
-                    << std::left << std::setw(6)  << (std::to_string(ap.pwr) + "dBm")
+                    << std::left << std::setw(6)  << (std::to_string(ap.pwr))
                     << std::left << std::setw(9)  << ap.beaconCount
                     << std::left << std::setw(7)  << ap.dataCount
                     << std::left << std::setw(6)  << ap.encryption
